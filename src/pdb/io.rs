@@ -22,7 +22,8 @@ use super::*;
 use crate::util::{RekordcrateError, RekordcrateResult, TableIndex};
 use binrw::{binrw, io::SeekFrom, BinRead, BinResult, BinWrite, Endian};
 use fallible_iterator::{FallibleIterator, IteratorExt};
-use std::io::{Read, Seek, Write};
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read, Seek, Write};
 
 /// A lazily loaded PDB database.
 #[binrw]
@@ -210,10 +211,46 @@ impl<RW: Read + Write + Seek> Database<RW> {
     }
 
     /// Flushes all changes to the underlying IO.
+    ///
+    /// A page is written as a whole block. Writing only the bytes a page needs would leave whatever
+    /// the previous version of that page had behind it, so a page that lost a row would keep the old
+    /// row's bytes in its free space, and a reader that checks that space is zero would reject the
+    /// page. Pages that were never loaded are left untouched instead of being overwritten.
     pub fn flush(&mut self) -> RekordcrateResult<()> {
         let endian = Endian::Little;
-        self.io.seek(SeekFrom::Start(0))?;
-        self.content.write_options(&mut self.io, endian, ())?;
+        let page_size = self.content.header.page_size;
+        let db_type = self.db_type;
+
+        let Self { io, content, .. } = self;
+        io.seek(SeekFrom::Start(0))?;
+
+        // The file header occupies the first page, and the pages after it start at a page boundary.
+        let mut header = Vec::with_capacity(page_size as usize);
+        content
+            .header
+            .write_options(&mut Cursor::new(&mut header), endian, (db_type,))?;
+        header.resize(page_size as usize, 0);
+        io.write_all(&header)?;
+
+        for page in &mut content.pages {
+            match page {
+                LazyPage::NotLoaded => {
+                    io.seek(SeekFrom::Current(i64::from(page_size)))?;
+                }
+                LazyPage::Loaded(page) => {
+                    let mut body = Vec::with_capacity(page_size as usize);
+                    page.write_options(&mut Cursor::new(&mut body), endian, (page_size,))?;
+                    if body.len() > page_size as usize {
+                        return Err(RekordcrateError::IntegrityError(
+                            "a page grew past the page size of the file",
+                        ));
+                    }
+                    body.resize(page_size as usize, 0);
+                    io.write_all(&body)?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -221,6 +258,237 @@ impl<RW: Read + Write + Seek> Database<RW> {
     pub fn close(mut self) -> RekordcrateResult<()> {
         self.flush()?;
         Ok(())
+    }
+
+    /// Returns the table that holds rows of the given page type.
+    fn table_index_of(&self, page_type: PageType) -> RekordcrateResult<TableIndex> {
+        self.content
+            .header
+            .tables
+            .iter()
+            .position(|table| table.page_type == page_type)
+            .map(TableIndex)
+            .ok_or(RekordcrateError::IntegrityError(
+                "the database has no table for this page type",
+            ))
+    }
+
+    /// Number of pages that exist in the file, plus one: the first index that is free to use.
+    ///
+    /// The header's `next_unused_page` cannot answer this. Exports keep a value well past the last
+    /// page that is actually in the file, so taking it at face value writes the new page beyond a
+    /// hole.
+    fn first_free_page(&mut self) -> RekordcrateResult<u32> {
+        let page_size = u64::from(self.content.header.page_size);
+        let length = self.io.seek(SeekFrom::End(0))?;
+        let pages = length.div_ceil(page_size);
+        Ok(u32::try_from(pages)
+            .map_err(|_| {
+                RekordcrateError::IntegrityError("the file has more pages than a u32 holds")
+            })?
+            .saturating_add(1))
+    }
+
+    /// Inserts a row into the table that holds the given page type.
+    ///
+    /// The row goes into the first data page of that table with room for it. If every page is full,
+    /// a data page is added to the table, which is why the file can grow by [`Database::page_size`]
+    /// bytes.
+    ///
+    /// Returns the page and the offset inside it where the row was placed.
+    pub fn insert_row(
+        &mut self,
+        page_type: PageType,
+        row: Row,
+    ) -> RekordcrateResult<(PageIndex, u16)> {
+        let bytes = row.heap_bytes_required(());
+        if bytes == 0 {
+            return Err(RekordcrateError::IntegrityError(
+                "a row whose size is unknown cannot be inserted",
+            ));
+        }
+
+        let mut row = Some(row);
+        let table_index = self.table_index_of(page_type)?;
+        let (first_page, last_page) = {
+            let table = &self.content.header.tables[table_index.0];
+            (table.first_page, table.last_page)
+        };
+
+        // A page that already belongs to the table costs nothing else: no new page, no new link.
+        let mut index = first_page;
+        loop {
+            let (next_page, at_last_page) = {
+                let page = self.load_page(index)?;
+                let next_page = page.header.next_page;
+                let at_last_page = index == last_page;
+
+                if page.content.as_data().is_some() {
+                    let offset = page.header.used_size;
+                    if let Some(insert) = page.allocate_row(bytes) {
+                        insert(row.take().expect("the row is inserted once"));
+                        return Ok((index, offset));
+                    }
+                }
+
+                (next_page, at_last_page)
+            };
+
+            if at_last_page {
+                break;
+            }
+            index = next_page;
+        }
+
+        // Every page is full. Copy what the last page knows, so the new one looks like its siblings.
+        let (next_page, unknown1, data_header) = {
+            let previous = self.load_page(last_page)?;
+            let data_header = previous.content.as_data().map(|data| data.header.clone());
+            (
+                previous.header.next_page,
+                previous.header.unknown1,
+                data_header.unwrap_or(DataPageHeader {
+                    unknown5: 1,
+                    unknown_not_num_rows_large: 0,
+                    unknown6: 0,
+                    unknown7: 0,
+                }),
+            )
+        };
+
+        let new_index = PageIndex(self.first_free_page()?);
+        let free_size = self.empty_page_free_size()?;
+        let mut page = Page {
+            header: PageHeader {
+                page_index: new_index,
+                page_type,
+                next_page,
+                unknown1,
+                unknown2: 0,
+                packed_row_counts: PackedRowCounts::new(),
+                page_flags: PageFlags::new_data_page(),
+                free_size,
+                used_size: 0,
+            },
+            content: PageContent::Data(DataPageContent {
+                header: data_header,
+                row_groups: Vec::new(),
+                rows: BTreeMap::new(),
+            }),
+        };
+
+        let offset = page.header.used_size;
+        let insert = page
+            .allocate_row(bytes)
+            .ok_or(RekordcrateError::IntegrityError(
+                "the row does not fit into an empty page",
+            ))?;
+        insert(row.take().expect("the row is inserted once"));
+
+        let slot = usize::try_from(new_index.0.saturating_sub(1)).map_err(|_| {
+            RekordcrateError::IntegrityError("page index does not fit into a usize")
+        })?;
+        if slot < self.content.pages.len() {
+            self.content.pages[slot] = LazyPage::Loaded(page);
+        } else {
+            self.content.pages.push(LazyPage::Loaded(page));
+        }
+        if new_index.0 >= self.content.header.next_unused_page.0 {
+            self.content.header.next_unused_page = PageIndex(new_index.0.saturating_add(1));
+        }
+
+        // The page that used to be last now leads to the new one, and the table says so too.
+        self.load_page(last_page)?.header.next_page = new_index;
+        self.content.header.tables[table_index.0].last_page = new_index;
+
+        Ok((new_index, offset))
+    }
+
+    /// Removes the row that sits at the given offset in a data page of the given page type.
+    ///
+    /// The page is rebuilt from the rows that stay, so the offsets, the row groups and the counts in
+    /// its header describe what is actually there afterwards. Rebuilding packs the remaining rows
+    /// densely, which means the offsets of the other rows in that page move: locate them again before
+    /// removing another one. Returns `false` if the offset holds no row.
+    pub fn remove_row_at(
+        &mut self,
+        page_type: PageType,
+        page_index: PageIndex,
+        offset: u16,
+    ) -> RekordcrateResult<bool> {
+        let (rows, data_header, next_page, unknown1) = {
+            let page = self.load_page(page_index)?;
+            if page.header.page_type != page_type {
+                return Err(RekordcrateError::IntegrityError(
+                    "the page holds rows of another type",
+                ));
+            }
+            let Some(data) = page.content.as_data() else {
+                return Err(RekordcrateError::IntegrityError(
+                    "rows live in data pages, not in index pages",
+                ));
+            };
+            let mut rows: Vec<(u16, Row)> = data
+                .rows
+                .iter()
+                .map(|(offset, row)| (*offset, row.clone()))
+                .collect();
+            let Some(position) = rows.iter().position(|(key, _)| *key == offset) else {
+                return Ok(false);
+            };
+            rows.remove(position);
+            (
+                rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+                data.header.clone(),
+                page.header.next_page,
+                page.header.unknown1,
+            )
+        };
+
+        let mut page = Page {
+            header: PageHeader {
+                page_index,
+                page_type,
+                next_page,
+                unknown1,
+                unknown2: 0,
+                packed_row_counts: PackedRowCounts::new(),
+                page_flags: PageFlags::new_data_page(),
+                free_size: self.empty_page_free_size()?,
+                used_size: 0,
+            },
+            content: PageContent::Data(DataPageContent {
+                header: data_header,
+                row_groups: Vec::new(),
+                rows: BTreeMap::new(),
+            }),
+        };
+        for row in rows {
+            let bytes = row.heap_bytes_required(());
+            let insert = page
+                .allocate_row(bytes)
+                .ok_or(RekordcrateError::IntegrityError(
+                    "the remaining rows do not fit into their page",
+                ))?;
+            insert(row);
+        }
+
+        let slot = usize::try_from(page_index.0.saturating_sub(1)).map_err(|_| {
+            RekordcrateError::IntegrityError("page index does not fit into a usize")
+        })?;
+        if slot >= self.content.pages.len() {
+            return Err(RekordcrateError::PageNotPresent(page_index));
+        }
+        self.content.pages[slot] = LazyPage::Loaded(page);
+        Ok(true)
+    }
+
+    /// The free space a data page with no rows has.
+    fn empty_page_free_size(&self) -> RekordcrateResult<u16> {
+        let page_size = self.content.header.page_size;
+        u16::try_from(page_size - PageHeader::BINARY_SIZE - DataPageHeader::BINARY_SIZE).map_err(
+            |_| RekordcrateError::IntegrityError("the page is too large to describe in 16 bits"),
+        )
     }
 }
 

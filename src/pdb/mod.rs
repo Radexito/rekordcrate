@@ -705,9 +705,12 @@ impl DataPageContent {
     }
 }
 
-// Usage of PageHeapObject is coming in a future PR.
-#[allow(dead_code)]
-trait PageHeapObject {
+/// Something that can be stored in the heap of a data page, and knows how much room it needs there.
+///
+/// This is what [`Page::allocate_row`] needs before it can reserve space, so it is public: without
+/// it, a caller can see that a page accepts a row but cannot say how large that row is.
+pub trait PageHeapObject {
+    /// Extra arguments needed to work out the size.
     type Args<'a>;
 
     /// Required page heap space in bytes to store the object.
@@ -2145,7 +2148,9 @@ impl PageHeapObject for Row {
         match self {
             Row::Plain(plain_row) => plain_row.heap_bytes_required(()),
             Row::Ext(ext_row) => ext_row.heap_bytes_required(()),
-            Row::Unknown => panic!("Unable to determine required bytes for unknown row type"),
+            // The format of the row is unknown, so its length is too. Callers that need a size must
+            // treat zero as "cannot be inserted" rather than guess one.
+            Row::Unknown => 0,
         }
     }
 }
