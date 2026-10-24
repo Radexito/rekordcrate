@@ -738,6 +738,14 @@ impl PageHeapObject for u32 {
     }
 }
 
+impl PageHeapObject for u64 {
+    type Args<'a> = ();
+
+    fn heap_bytes_required(&self, _: ()) -> u16 {
+        std::mem::size_of::<u64>() as u16
+    }
+}
+
 impl PageHeapObject for ColorIndex {
     type Args<'a> = ();
     fn heap_bytes_required(&self, _: ()) -> u16 {
@@ -1387,6 +1395,11 @@ pub struct History {
     pub version: DeviceSQLString,
     /// Device or backup label. Can be empty.
     pub label: DeviceSQLString,
+    /// Eight zero bytes the deck writes here.
+    ///
+    /// They appear in every history row that was measured (29 rows across 60 exports), and they are
+    /// what makes a row occupy the forty bytes the deck gives it. Building a row means writing zero.
+    pub unknown_tail: u64,
 }
 
 impl PageHeapObject for History {
@@ -1401,6 +1414,7 @@ impl PageHeapObject for History {
             (0u16).heap_bytes_required(()),
             self.version.heap_bytes_required(()),
             self.label.heap_bytes_required(()),
+            self.unknown_tail.heap_bytes_required(()),
         ]
         .iter()
         .sum()

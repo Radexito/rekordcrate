@@ -176,14 +176,32 @@ fn inserting_adds_a_page_when_the_last_one_is_full() {
 }
 
 #[test]
-fn removing_a_row_leaves_the_page_consistent() {
+fn removing_a_row_keeps_every_other_offset() {
     let mut data = Vec::from(TEST_DB);
 
-    let (page, offset, before) = {
+    let (page, offset, before_offsets, used_before, rows_before, table_rows_before) = {
         let mut db = open(Cursor::new(data.as_slice()));
         let rows = rows_of(&mut db, keys_table());
+        let table_rows_before = rows.len();
         let (page, offset, _) = *rows.first().expect("the table has a row");
-        (page, offset, rows.len())
+        let page_ref = db.load_page(page).expect("page loads");
+        let mut offsets: Vec<u16> = page_ref
+            .content
+            .as_data()
+            .expect("data page")
+            .rows
+            .keys()
+            .copied()
+            .collect();
+        offsets.sort_unstable();
+        (
+            page,
+            offset,
+            offsets,
+            page_ref.header.used_size,
+            page_ref.header.packed_row_counts.num_rows(),
+            table_rows_before,
+        )
     };
 
     {
@@ -193,52 +211,57 @@ fn removing_a_row_leaves_the_page_consistent() {
                 .expect("the row is removed"),
             "the row was there"
         );
-        // The page is rebuilt without the row, so the offsets that stay move down. An offset that
-        // is past everything the page now holds has nothing to remove.
-        let rebuilt_used_size = {
-            let page = db.load_page(page).expect("the page still loads");
-            page.header.used_size
-        };
         assert!(
-            !db.remove_row_at(keys_table(), page, rebuilt_used_size.saturating_add(4))
-                .expect("an empty offset is not an error"),
-            "nothing sits past the rows that are left"
+            !db.remove_row_at(keys_table(), page, offset)
+                .expect("removing twice is not an error"),
+            "the same offset holds nothing now"
         );
         db.close().expect("close");
     }
 
     let mut db = open(Cursor::new(data.as_slice()));
-    let rows = rows_of(&mut db, keys_table());
-    assert_eq!(rows.len(), before - 1, "one row fewer");
 
-    // The rebuilt page has to agree with itself: the counts in its header describe the rows that
-    // are in it, and no offset points past the heap it wrote.
-    {
-        let page = db.load_page(page).expect("the page still loads");
-        let data = page.content.as_data().expect("still a data page");
-        assert_eq!(
-            usize::from(page.header.packed_row_counts.num_rows()),
-            data.rows.len()
-        );
-        assert_eq!(
-            usize::from(page.header.packed_row_counts.num_rows_valid()),
-            data.rows.len()
-        );
-        for offset in data.rows.keys() {
-            assert!(
-                *offset < page.header.used_size,
-                "offset {offset} is inside the heap"
-            );
-        }
-    }
+    let (after_offsets, used_after, rows_after, valid_after, deleted_flag) = {
+        let page_ref = db.load_page(page).expect("page loads");
+        let mut offsets: Vec<u16> = page_ref
+            .content
+            .as_data()
+            .expect("data page")
+            .rows
+            .keys()
+            .copied()
+            .collect();
+        offsets.sort_unstable();
+        (
+            offsets,
+            page_ref.header.used_size,
+            page_ref.header.packed_row_counts.num_rows(),
+            page_ref.header.packed_row_counts.num_rows_valid(),
+            page_ref.header.page_flags.contains_deleted(),
+        )
+    };
 
-    // Every remaining row still parses, which means the rebuilt page is not corrupt.
+    let mut expected = before_offsets.clone();
+    expected.retain(|entry| *entry != offset);
+    assert_eq!(
+        after_offsets, expected,
+        "the other rows stay where they were"
+    );
+    assert_eq!(used_after, used_before, "the heap does not shrink");
+    assert_eq!(rows_after, rows_before, "the slot is still allocated");
+    assert_eq!(
+        usize::from(valid_after),
+        expected.len(),
+        "one row fewer counts as valid"
+    );
+    assert!(deleted_flag, "the page says it holds a deleted row");
+
     let keys = db
         .iter_rows::<Key>()
         .expect("rows load")
         .collect::<Vec<_>>()
         .expect("rows read");
-    assert_eq!(keys.len(), before - 1);
+    assert_eq!(keys.len(), table_rows_before - 1);
 }
 
 #[test]
@@ -255,21 +278,19 @@ fn a_row_of_unknown_size_is_refused() {
 }
 
 #[test]
-fn a_page_that_lost_its_last_row_keeps_no_bytes_of_it() {
+fn a_table_drops_a_page_that_has_no_rows_left() {
     let mut data = Vec::from(TEST_DB);
 
-    let (page, offset) = {
+    let page = {
         let mut db = open(Cursor::new(data.as_slice()));
-        let (page, offset, _) = rows_of(&mut db, genres_table())
-            .into_iter()
-            .next()
-            .expect("the genres table has a row");
-        (page, offset)
+        rows_of(&mut db, genres_table())
+            .first()
+            .expect("the genres table has a row")
+            .0
     };
 
     {
         let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
-        // Empty the table completely, whatever it holds.
         while let Some((row_page, row_offset, _)) =
             rows_of(&mut db, genres_table()).into_iter().next()
         {
@@ -279,17 +300,74 @@ fn a_page_that_lost_its_last_row_keeps_no_bytes_of_it() {
         db.close().expect("close");
     }
 
-    let _ = (page, offset);
+    let mut db = open(Cursor::new(data.as_slice()));
 
-    // A page with no rows has nothing after its header but zeros. Writing only what a page needs
-    // would leave the bytes of the rows it used to hold sitting in its free space, which is what a
-    // reader that checks that space catches.
-    let page_offset = page.offset(4096) as usize;
-    let body = &data[page_offset + 40..page_offset + 4096];
-    let first_non_zero = body.iter().position(|byte| *byte != 0);
-    assert_eq!(
-        first_non_zero, None,
-        "the emptied page still carries bytes: {first_non_zero:?}"
+    let (table_index, _) = db.get_header().find_table(genres_table()).expect("table");
+    let mut reachable = Vec::new();
+    let mut pages = db.iter_pages_for_table(table_index).expect("pages");
+    while let Ok(Some(entry)) = pages.next() {
+        reachable.push(entry.header.page_index.offset(4096));
+    }
+    assert!(
+        !reachable.contains(&page.offset(4096)),
+        "the emptied page left the table"
+    );
+
+    let page_ref = db.load_page(page).expect("the page still loads");
+    assert_eq!(page_ref.header.packed_row_counts.num_rows(), 0);
+    let body_start = page.offset(4096) as usize + 40;
+    let body = &data[body_start..body_start + 4056];
+    assert!(
+        body.iter().all(|byte| *byte == 0),
+        "the emptied page still carries bytes"
+    );
+}
+
+#[test]
+fn a_page_that_a_table_dropped_is_used_again() {
+    let mut data = Vec::from(TEST_DB);
+    let size_before = data.len();
+
+    let dropped = {
+        let mut db = open(Cursor::new(data.as_slice()));
+        rows_of(&mut db, genres_table())
+            .first()
+            .expect("a genre row")
+            .0
+    };
+
+    {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        while let Some((row_page, row_offset, _)) =
+            rows_of(&mut db, genres_table()).into_iter().next()
+        {
+            db.remove_row_at(genres_table(), row_page, row_offset)
+                .expect("removed");
+        }
+
+        let template = rows_of(&mut db, keys_table())
+            .into_iter()
+            .next()
+            .expect("a key row")
+            .2;
+        let mut used_pages = Vec::new();
+        for _ in 0..800 {
+            let (page, _) = db
+                .insert_row(keys_table(), spare_row(&template))
+                .expect("insert");
+            used_pages.push(page.offset(4096));
+        }
+        assert!(
+            used_pages.contains(&dropped.offset(4096)),
+            "the freed page was used for new rows"
+        );
+        db.close().expect("close");
+    }
+
+    let pages_of_new_data = (data.len() - size_before) / 4096;
+    assert!(
+        pages_of_new_data < 3,
+        "the freed page saved a page: the file grew by {pages_of_new_data}"
     );
 }
 
@@ -438,5 +516,64 @@ fn an_appended_page_is_listed_in_an_index_that_carries_entries() {
     assert!(
         entries.contains(&new_page),
         "the last page the table grew is listed in the index"
+    );
+}
+
+#[test]
+fn a_history_row_occupies_the_forty_bytes_the_deck_gives_it() {
+    let mut data = Vec::from(TEST_DB);
+    let history = PageType::Plain(PlainPageType::History);
+
+    let placed = {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        let placed = db
+            .insert_row(
+                history,
+                Row::Plain(PlainRow::History(History {
+                    subtype: Subtype(640),
+                    index_shift: 0,
+                    num_tracks: 1,
+                    date: "2026-10-24".parse().expect("string"),
+                    version: "1000".parse().expect("string"),
+                    label: "".parse().expect("string"),
+                    unknown_tail: 0,
+                })),
+            )
+            .expect("the row is inserted");
+        db.close().expect("close");
+        placed
+    };
+
+    let mut db = open(Cursor::new(data.as_slice()));
+
+    let occupied = {
+        let page = db.load_page(placed.0).expect("page loads");
+        let content = page.content.as_data().expect("data page");
+        let mut offsets: Vec<u16> = content.rows.keys().copied().collect();
+        offsets.sort_unstable();
+        let index = offsets
+            .iter()
+            .position(|entry| *entry == placed.1)
+            .expect("the row is in the page");
+        let end = offsets
+            .get(index + 1)
+            .copied()
+            .unwrap_or(page.header.used_size);
+        end - placed.1
+    };
+    assert_eq!(
+        occupied, 40,
+        "a history row takes forty bytes, not the thirty nine the fields add up to"
+    );
+
+    let rows = db
+        .iter_rows::<History>()
+        .expect("rows load")
+        .collect::<Vec<_>>()
+        .expect("rows read");
+    assert!(
+        rows.iter()
+            .any(|row| row.date.clone().into_string().expect("date") == "2026-10-24"),
+        "the new history row reads back"
     );
 }
