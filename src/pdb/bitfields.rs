@@ -84,6 +84,11 @@ impl PackedRowCounts {
     pub(crate) fn increment_num_rows_valid(&mut self) {
         self.set_num_rows_valid(self.num_rows_valid() + 1);
     }
+
+    /// Mark one row as no longer valid, e.g. when a row is removed from the page.
+    pub(crate) fn decrement_num_rows_valid(&mut self) {
+        self.set_num_rows_valid(self.num_rows_valid().saturating_sub(1));
+    }
 }
 
 /// Page flags stored in the page header.
