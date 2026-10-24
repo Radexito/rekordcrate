@@ -365,3 +365,78 @@ fn a_genre_built_from_scratch_can_be_inserted() {
         "Drum & Bass"
     );
 }
+
+#[test]
+fn an_appended_page_is_listed_in_an_index_that_carries_entries() {
+    let mut data = Vec::from(TEST_DB);
+
+    // Most tables keep their index page empty, so seed one entry to exercise the bookkeeping. The
+    // rows stay ordinary key rows, because History rows still do not serialize to the 40 bytes a
+    // native export gives them.
+    {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        let (table_index, table) = db
+            .get_header()
+            .find_table(keys_table())
+            .expect("table is present");
+        let first_page = table.first_page;
+        let data_page = {
+            let mut pages = db.iter_pages_for_table(table_index).expect("pages");
+            let mut found = None;
+            while let Ok(Some(page)) = pages.next() {
+                if page.content.as_data().is_some() {
+                    found = Some(page.header.page_index);
+                    break;
+                }
+            }
+            found.expect("a data page")
+        };
+
+        let page = db.load_page(first_page).expect("index page");
+        let index = page.content.as_index_mut().expect("index page");
+        index.header.num_entries = 1;
+        index.header.next_offset = 1;
+        index.entries = vec![IndexEntry::try_from((data_page, 0)).expect("an entry")];
+        db.close().expect("close");
+    }
+
+    let (new_page, entries) = {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        let (_, table) = db.get_header().find_table(keys_table()).expect("table");
+        let first_page = table.first_page;
+        let template = rows_of(&mut db, keys_table())
+            .into_iter()
+            .next()
+            .expect("a row")
+            .2;
+
+        let mut new_page = None;
+        for _ in 0..800 {
+            let (page, _) = db
+                .insert_row(keys_table(), spare_row(&template))
+                .expect("insert");
+            new_page = Some(page);
+        }
+        let new_page = new_page.expect("a page");
+
+        let page = db.load_page(first_page).expect("index page");
+        let index = page.content.as_index().expect("index page");
+        let entries: Vec<_> = index
+            .entries
+            .iter()
+            .filter_map(|entry| entry.page_index().ok())
+            .map(|page| page.offset(4096))
+            .collect();
+        db.close().expect("close");
+        (new_page.offset(4096), entries)
+    };
+
+    assert!(
+        entries.len() > 1,
+        "the index lists the pages that were added"
+    );
+    assert!(
+        entries.contains(&new_page),
+        "the last page the table grew is listed in the index"
+    );
+}

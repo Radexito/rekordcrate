@@ -295,6 +295,8 @@ impl<RW: Read + Write + Seek> Database<RW> {
     /// a data page is added to the table, which is why the file can grow by [`Database::page_size`]
     /// bytes.
     ///
+    /// If the table's index page carries entries, the new page is listed there too.
+    ///
     /// Returns the page and the offset inside it where the row was placed.
     pub fn insert_row(
         &mut self,
@@ -400,6 +402,28 @@ impl<RW: Read + Write + Seek> Database<RW> {
         // The page that used to be last now leads to the new one, and the table says so too.
         self.load_page(last_page)?.header.next_page = new_index;
         self.content.header.tables[table_index.0].last_page = new_index;
+
+        // A table whose index page carries entries has to list the new page, or a reader that walks
+        // that index never sees it. Most tables keep the index empty (827 of 870 in the exports), and
+        // those stay empty, the same way the files rekordbox writes look.
+        let page_size = self.content.header.page_size;
+        {
+            let index_page = self.load_page(first_page)?;
+            if let Some(index) = index_page.content.as_index_mut() {
+                if !index.entries.is_empty()
+                    && index.entries.len() < IndexPageContent::total_entries(page_size)
+                {
+                    let flags = index.entries.last().map_or(0, |entry| entry.index_flags());
+                    if let Ok(entry) = IndexEntry::try_from((new_index, flags)) {
+                        index.entries.push(entry);
+                        if let Ok(count) = u16::try_from(index.entries.len()) {
+                            index.header.num_entries = count;
+                        }
+                        index.header.next_offset = index.header.next_offset.saturating_add(1);
+                    }
+                }
+            }
+        }
 
         Ok((new_index, offset))
     }
