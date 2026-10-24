@@ -292,3 +292,76 @@ fn a_page_that_lost_its_last_row_keeps_no_bytes_of_it() {
         "the emptied page still carries bytes: {first_non_zero:?}"
     );
 }
+
+#[test]
+fn a_key_built_from_scratch_can_be_inserted() {
+    let mut data = Vec::from(TEST_DB);
+    let before = {
+        let mut db = open(Cursor::new(data.as_slice()));
+        rows_of(&mut db, keys_table()).len()
+    };
+
+    let row = Row::Plain(PlainRow::Key(Key {
+        id: KeyId(4242),
+        id2: 4242,
+        name: "Gmaj".parse().expect("a valid DeviceSQL string"),
+    }));
+
+    {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        db.insert_row(keys_table(), row)
+            .expect("the row is inserted");
+        db.close().expect("close");
+    }
+
+    let mut db = open(Cursor::new(data.as_slice()));
+    let keys = db
+        .iter_rows::<Key>()
+        .expect("rows load")
+        .collect::<Vec<_>>()
+        .expect("rows read");
+    assert_eq!(keys.len(), before + 1);
+
+    let added = keys
+        .iter()
+        .find(|key| key.id.0 == 4242)
+        .expect("the new key is in the table");
+    assert_eq!(added.id2, 4242, "the second copy of the id travels with it");
+    assert_eq!(
+        added.name.clone().into_string().expect("a readable name"),
+        "Gmaj"
+    );
+}
+
+#[test]
+fn a_genre_built_from_scratch_can_be_inserted() {
+    let mut data = Vec::from(TEST_DB);
+
+    // 77 is already taken in the test database, so pick an id nothing uses.
+    let row = Row::Plain(PlainRow::Genre(Genre {
+        id: GenreId(60_000),
+        name: "Drum & Bass".parse().expect("a valid DeviceSQL string"),
+    }));
+
+    {
+        let mut db = Database::open(Cursor::new(&mut data), DatabaseType::Plain).expect("open");
+        db.insert_row(genres_table(), row)
+            .expect("the row is inserted");
+        db.close().expect("close");
+    }
+
+    let mut db = open(Cursor::new(data.as_slice()));
+    let genres = db
+        .iter_rows::<Genre>()
+        .expect("rows load")
+        .collect::<Vec<_>>()
+        .expect("rows read");
+    let added = genres
+        .iter()
+        .find(|genre| genre.id.0 == 60_000)
+        .expect("the new genre is in the table");
+    assert_eq!(
+        added.name.clone().into_string().expect("a readable name"),
+        "Drum & Bass"
+    );
+}
